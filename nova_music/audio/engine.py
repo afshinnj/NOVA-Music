@@ -29,6 +29,7 @@ class AudioEngine(QObject):
     spectrumReady = Signal(object)
     errorOccurred = Signal(str)
     trackEnded = Signal()
+    trackFailed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -53,6 +54,7 @@ class AudioEngine(QObject):
         self._filter_state = []
         self._last_emit = 0.0
         self._frames_played = 0
+        self.output_frames_total = 0
         self._last_position_emit_frame = 0
         self._end_notified = False
         self._generation = 0
@@ -112,7 +114,12 @@ class AudioEngine(QObject):
             self._paused = False
             self.playbackStateChanged.emit(True)
         except Exception as exc:
+            self._playing = False
+            self._paused = False
+            self._stop_stream()
+            self._stop_decoder()
             self.errorOccurred.emit(str(exc))
+            self.playbackStateChanged.emit(False)
 
     def pause(self):
         if not self._playing:
@@ -337,6 +344,7 @@ class AudioEngine(QObject):
         if take:
             processed = self._process_eq(block)
             outdata[:take] = processed * self.volume
+            self.output_frames_total += take
 
             # Position is based on frames actually handed to the output stream,
             # rather than wall-clock timer ticks.
@@ -376,7 +384,10 @@ class AudioEngine(QObject):
             self._end_notified = True
             self._playing = False
             self._paused = False
-            self.trackEnded.emit()
+            if process.returncode == 0:
+                self.trackEnded.emit()
+            else:
+                self.trackFailed.emit()
             self.playbackStateChanged.emit(False)
 
     def _process_eq(self, block):
