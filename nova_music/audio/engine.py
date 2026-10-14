@@ -27,9 +27,11 @@ class AudioEngine(QObject):
     playbackStateChanged = Signal(bool)
     sourceChanged = Signal(str)
     spectrumReady = Signal(object)
+    waveformReady = Signal(int, int, float)
     errorOccurred = Signal(str)
     trackEnded = Signal()
     trackFailed = Signal()
+    crossfadeFinished = Signal(str, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -41,6 +43,13 @@ class AudioEngine(QObject):
         self.volume = 0.75
         self._process = None
         self._stream = None
+        self.output_device = None
+        self.crossfade_ms = 0
+        self._next_path = ""
+        self._next_process = None
+        self._next_buffer = np.zeros((0, 2), dtype=np.float32)
+        self._crossfade_done = 0
+        self._crossfade_total = 0
         self._playing = False
         self._paused = False
         self._lock = threading.RLock()
@@ -90,6 +99,89 @@ class AudioEngine(QObject):
         self.sourceChanged.emit(self.path)
         self.durationChanged.emit(self.duration_ms)
 
+    def output_devices(self):
+        result = [(None, "پیش‌فرض سیستم")]
+        hostapis = sd.query_hostapis()
+        for index, device in enumerate(sd.query_devices()):
+            if int(device.get("max_output_channels", 0)) >= self.channels:
+                hostapi = int(device.get("hostapi", -1))
+                api_name = hostapis[hostapi]["name"] if 0 <= hostapi < len(hostapis) else ""
+                result.append((index, f"{device['name']} ({api_name})" if api_name else device["name"]))
+        return result
+
+    def set_output_device(self, device_id):
+        was_running = self._playing
+        old_device = self.output_device
+        if was_running: self._stop_stream()
+        self.output_device = device_id
+        try:
+            if was_running: self._start_stream()
+        except Exception:
+            self.output_device = old_device
+            if was_running: self._start_stream()
+            raise
+
+    def set_crossfade(self, milliseconds):
+        self.crossfade_ms = max(0, min(12000, int(milliseconds)))
+        if not self.crossfade_ms:
+            self._stop_next_decoder()
+            self._next_path = ""
+
+    def set_next_source(self, path):
+        self._stop_next_decoder()
+        self._next_path = str(path or "")
+        self._crossfade_done = self._crossfade_total = 0
+        if not self._next_path or not self._playing or not self.crossfade_ms: return
+        try:
+            command = [self._ffmpeg(), "-hide_banner", "-loglevel", "error", "-i", self._next_path,
+                       "-vn", "-f", "f32le", "-acodec", "pcm_f32le", "-ar", str(self.sample_rate),
+                       "-ac", str(self.channels), "pipe:1"]
+            self._next_process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+            threading.Thread(target=self._read_next_decoder, args=(self._next_process,), daemon=True, name="NOVA-FFmpeg-next").start()
+        except Exception as exc:
+            self._next_process = None
+            self.errorOccurred.emit(f"آماده‌سازی Crossfade ناموفق بود: {exc}")
+
+    def _stop_next_decoder(self):
+        process, self._next_process = self._next_process, None
+        if process:
+            try:
+                if process.poll() is None: process.terminate()
+                process.wait(timeout=1)
+            except Exception:
+                try: process.kill()
+                except Exception: pass
+        with self._lock: self._next_buffer = np.zeros((0, self.channels), dtype=np.float32)
+
+    def _read_next_decoder(self, process):
+        if not process.stdout: return
+        carry = b""; bpf = 4 * self.channels
+        try:
+            while True:
+                chunk = process.stdout.read(16384)
+                if not chunk: break
+                data = carry + chunk; usable = len(data) - len(data) % bpf
+                if usable:
+                    samples = np.frombuffer(data[:usable], dtype="<f4").reshape(-1, self.channels).copy()
+                    with self._buffer_condition:
+                        if process is self._process:
+                            room = max(0, self._buffer_limit_frames - len(self._buffer))
+                            if room: self._buffer = np.concatenate((self._buffer, samples[:room]), axis=0)
+                        else:
+                            offset = 0
+                            while offset < len(samples):
+                                room = self._buffer_limit_frames - len(self._next_buffer)
+                                while room <= 0 and process is self._next_process:
+                                    self._buffer_condition.wait(timeout=0.1)
+                                    room = self._buffer_limit_frames - len(self._next_buffer)
+                                if process is not self._next_process: return
+                                take = min(room, len(samples) - offset)
+                                self._next_buffer = np.concatenate((self._next_buffer, samples[offset:offset + take]), axis=0)
+                                offset += take
+                    carry = data[usable:]
+                else: carry = data
+        except Exception: pass
+
     def _probe_duration(self, path):
         try:
             from mutagen import File as MutagenFile
@@ -138,6 +230,7 @@ class AudioEngine(QObject):
         self._generation += 1
         self._stop_stream()
         self._stop_decoder()
+        self._stop_next_decoder()
         with self._lock:
             self._buffer = np.zeros((0, self.channels), dtype=np.float32)
             self._buffer_cursor = 0
@@ -244,7 +337,10 @@ class AudioEngine(QObject):
                 if len(tail) > 8192:
                     del tail[:-8192]
             return_code = process.wait()
-            if return_code and generation == self._generation:
+            # pause(), seek and stop intentionally terminate FFmpeg. _stop_decoder
+            # clears the active process reference before terminating it, so only
+            # report a non-zero exit while this is still the current decoder.
+            if return_code and generation == self._generation and process is self._process:
                 detail = tail.decode("utf-8", errors="replace").strip()
                 message = f"خطای FFmpeg (کد {return_code})"
                 if detail:
@@ -292,7 +388,8 @@ class AudioEngine(QObject):
             return
         self._stream = sd.OutputStream(
             samplerate=self.sample_rate, channels=self.channels,
-            dtype="float32", blocksize=1024, callback=self._audio_callback
+            dtype="float32", blocksize=1024, callback=self._audio_callback,
+            device=self.output_device
         )
         self._stream.start()
 
@@ -340,10 +437,30 @@ class AudioEngine(QObject):
             else:
                 block = np.zeros((0, self.channels), dtype=np.float32)
             process = self._process
+            next_take = 0
+            next_block = None
+            fade_start = max(0, self.duration_ms * self.sample_rate // 1000 - self.crossfade_ms * self.sample_rate // 1000)
+            if (take and self._next_process and self._next_path and self.crossfade_ms
+                    and self._frames_played + take > fade_start):
+                offset = max(0, fade_start - self._frames_played)
+                fade_count = min(take - offset, max(0, self.crossfade_ms * self.sample_rate // 1000 - self._crossfade_done))
+                next_take = min(fade_count, len(self._next_buffer))
+                if next_take:
+                    next_block = self._next_buffer[:next_take].copy()
+                    self._next_buffer = self._next_buffer[next_take:]
+                    self._buffer_condition.notify_all()
+                    self._crossfade_total = self.crossfade_ms * self.sample_rate // 1000
+                    self._crossfade_done += next_take
+                    self._buffer_condition.notify_all()
 
         if take:
             processed = self._process_eq(block)
             outdata[:take] = processed * self.volume
+            if next_take and next_block is not None:
+                incoming = self._process_eq(next_block)
+                start = max(0, fade_start - self._frames_played)
+                weights = (self._crossfade_done - next_take + np.arange(1, next_take + 1)) / max(1, self._crossfade_total)
+                outdata[start:start + next_take] = (processed[start:start + next_take] * (1.0 - weights[:, None]) + incoming * weights[:, None]) * self.volume
             self.output_frames_total += take
 
             # Position is based on frames actually handed to the output stream,
@@ -356,6 +473,8 @@ class AudioEngine(QObject):
             if self._frames_played - self._last_position_emit_frame >= int(self.sample_rate * 0.1):
                 self._last_position_emit_frame = self._frames_played
                 self.positionChanged.emit(self.position_ms)
+                rms=float(np.sqrt(np.mean(np.square(outdata[:take])))) if take else 0.0
+                self.waveformReady.emit(self.position_ms,self.duration_ms,min(1.0,math.sqrt(max(0.0,rms))*1.35))
 
             # Real-time 24-bin FFT spectrum. Keep it lightweight and emit every
             # few callback blocks to reduce UI/Qt signal overhead.
@@ -379,7 +498,29 @@ class AudioEngine(QObject):
         # End only after FFmpeg has exited AND all decoded frames have drained.
         with self._lock:
             buffer_empty = len(self._buffer) == 0
-        if (take < frames and buffer_empty and process is not None
+        if (self._crossfade_total and self._crossfade_done >= self._crossfade_total and self._next_process):
+            with self._lock:
+                old = self._process
+                self.path = self._next_path
+                self.duration_ms = self._probe_duration(self.path)
+                self.position_ms = self.crossfade_ms
+                self._frames_played = self._crossfade_done
+                self._last_position_emit_frame = self._frames_played
+                self._process = self._next_process
+                self._buffer = self._next_buffer
+                self._next_buffer = np.zeros((0, self.channels), dtype=np.float32)
+                self._next_process = None
+                self._next_path = ""
+                self._crossfade_done = self._crossfade_total = 0
+                self._end_notified = False
+            if old:
+                try:
+                    if old.poll() is None: old.terminate()
+                except Exception: pass
+            self.crossfadeFinished.emit(self.path, self.output_frames_total)
+            self.sourceChanged.emit(self.path)
+            self.durationChanged.emit(self.duration_ms)
+        elif (take < frames and buffer_empty and process is not None
                 and process.poll() is not None and not self._end_notified):
             self._end_notified = True
             self._playing = False

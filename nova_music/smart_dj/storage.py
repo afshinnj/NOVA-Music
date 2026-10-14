@@ -38,6 +38,18 @@ def initialize(conn: sqlite3.Connection) -> None:
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS playlists (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS playlist_tracks (
+            playlist_id INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            track_path TEXT NOT NULL,
+            PRIMARY KEY (playlist_id, position),
+            UNIQUE (playlist_id, track_path)
+        );
         CREATE INDEX IF NOT EXISTS idx_listening_sessions_track
             ON listening_sessions(track_path, started_at);
         CREATE INDEX IF NOT EXISTS idx_listening_sessions_outcome
